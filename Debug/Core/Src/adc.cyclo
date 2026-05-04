@@ -1,8 +1,0 @@
-../Core/Src/adc.c:19:17:SmaProcess	3
-../Core/Src/adc.c:41:10:ADC_GetLimit1LowFiltered	1
-../Core/Src/adc.c:42:10:ADC_GetLimit1HighFiltered	1
-../Core/Src/adc.c:43:10:ADC_GetLimit2LowFiltered	1
-../Core/Src/adc.c:44:10:ADC_GetLimit2HighFiltered	1
-../Core/Src/adc.c:45:10:ADC_GetIgniterFiltered	1
-../Core/Src/adc.c:46:10:ADC_GetU24Filtered	1
-../Core/Src/adc.c:48:6:HAL_ADC_ConvCpltCallback	3
