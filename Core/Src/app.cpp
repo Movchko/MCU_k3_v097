@@ -463,10 +463,10 @@ void App_Timer1ms(void)
     } else {
         status_cnt = 0u;
         uint8_t status_data[7] = {0};
-        status_data[0] = (uint8_t)(now & 0xFFu);
-        status_data[1] = (uint8_t)((now >> 8) & 0xFFu);
-        status_data[2] = (uint8_t)((now >> 16) & 0xFFu);
-        status_data[3] = (uint8_t)((now >> 24) & 0xFFu);
+        status_data[0] = (uint8_t)(now / 1000u);
+        status_data[1] = 0u;
+        status_data[2] = 0u;
+        status_data[3] = 0u;
         status_data[4] = (uint8_t)(CAN1_Active | (CAN2_Active << 1));
 
         const uint32_t VREF_MV = 3300u;
@@ -475,11 +475,11 @@ void App_Timer1ms(void)
         uint32_t raw_u24 = ADC_GetU24Filtered();
         uint32_t v_adc_mv = (raw_u24 * VREF_MV) / ADC_MAX;
         uint32_t u24_mv   = v_adc_mv * DIV_K;
-        uint32_t code_01v = u24_mv / 100u;
-        if (code_01v > 255u) {
-            code_01v = 255u;
+        uint32_t code_1v = u24_mv / 1000u;
+        if (code_1v > 255u) {
+            code_1v = 255u;
         }
-        status_data[5] = (uint8_t)code_01v;
+        status_data[5] = (uint8_t)code_1v;
         status_data[6] = App_GetCanStateMask();
         SendMessage(0, 0, status_data, SEND_NOW, BUS_CAN12);
     }
