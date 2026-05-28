@@ -110,8 +110,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_SetTickFreq(HAL_TICK_FREQ_1KHZ);
   FDCAN_StartAll();
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)MCU_K3_ADC_VAL, MCU_K3_NUM_ADC_CHANNEL);
   App_Init();
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)MCU_K3_ADC_VAL, MCU_K3_NUM_ADC_CHANNEL);
 
   /* USER CODE END 2 */
 
@@ -128,6 +128,7 @@ int main(void)
       last_tick = now;
       App_Timer1ms();
     }
+    App_CanProcess();
     App_CanTxProcess();
   }
   /* USER CODE END 3 */
@@ -216,12 +217,12 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   hadc1.Init.LowPowerAutoWait = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.NbrOfConversion = 6;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.SamplingMode = ADC_SAMPLING_MODE_NORMAL;
   hadc1.Init.Overrun = ADC_OVR_DATA_PRESERVED;
   hadc1.Init.OversamplingMode = DISABLE;

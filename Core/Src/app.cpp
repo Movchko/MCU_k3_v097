@@ -27,6 +27,48 @@ static VDeviceLimitSwitch g_limit1(1);
 static VDeviceLimitSwitch g_limit2(2);
 static VDeviceIgniter g_igniter(3);
 
+/* Калибровка "сырых" Ом в шкалу порогов device_lib:
+ * - открытие должно попадать в 100..159 Ом
+ * - норма должна попадать в 820..2000 Ом
+ * Точки калибровки с текущего стенда:
+ *   raw=0      -> mapped=120  (Открытие)
+ *   raw=18437  -> mapped=1000 (Норма)
+ */
+static uint16_t App_MapLswitchResistanceForLib(uint32_t raw_ohm, uint8_t normal_closed)
+{
+    const uint32_t RAW_OPEN  = 0u;
+    const uint32_t LIB_OPEN  = 120u;
+    const uint32_t RAW_NORM  = 18437u;
+    const uint32_t LIB_NORM  = 1000u;
+    const uint32_t dst_open  = normal_closed ? LIB_NORM : LIB_OPEN;
+    const uint32_t dst_norm  = normal_closed ? LIB_OPEN : LIB_NORM;
+
+    if (raw_ohm <= RAW_OPEN) {
+        return (uint16_t)dst_open;
+    }
+
+    /* Линейная интерполяция между двумя опорными точками.
+     * В режиме NC наклон отрицательный, поэтому считаем в signed.
+     */
+    const int32_t den = (int32_t)(RAW_NORM - RAW_OPEN);
+    const int32_t d_dst = (int32_t)dst_norm - (int32_t)dst_open;
+    int64_t num = (int64_t)((int32_t)raw_ohm - (int32_t)RAW_OPEN) * (int64_t)d_dst;
+    if (num >= 0) {
+        num += (int64_t)(den / 2);
+    } else {
+        num -= (int64_t)(den / 2);
+    }
+    int64_t mapped_signed = (int64_t)(int32_t)dst_open + (num / (int64_t)den);
+
+    if (mapped_signed < 0) {
+        mapped_signed = 0;
+    }
+    if (mapped_signed > 65535) {
+        mapped_signed = 65535;
+    }
+    return (uint16_t)mapped_signed;
+}
+
 static uint32_t g_extinguish_deadline_ms[NUM_DEV_IN_MCU];
 static uint8_t  g_extinguish_armed[NUM_DEV_IN_MCU];
 
@@ -415,8 +457,11 @@ void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
     if (k_scaled > 1500) k_scaled = 1500;
 
     uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
+    DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[0].reserv);
+    uint8_t normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
 
-    g_limit1.SetAdcValues((uint16_t)r_corr, (uint16_t)ch_h);
+    g_limit1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
 }
 
 void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
@@ -449,7 +494,10 @@ void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
     if (k_scaled > 1500) k_scaled = 1500;
 
     uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    g_limit2.SetAdcValues((uint16_t)r_corr, (uint16_t)ch_h);
+    DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[1].reserv);
+    uint8_t normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
+    g_limit2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
 }
 
 void App_Timer1ms(void)
@@ -482,6 +530,9 @@ void App_Timer1ms(void)
         status_data[5] = (uint8_t)code_1v;
         status_data[6] = App_GetCanStateMask();
         SendMessage(0, 0, status_data, SEND_NOW, BUS_CAN12);
+
+        uint8_t pos_data[7] = {0u, 0u, 0u, 0u, 0u, 0u, 0u};
+        SendMessage(0, ServiceCmd_PositionDevice, pos_data, SEND_NOW, BUS_CAN12);
     }
 
     if (led_cnt < 1000u) {
@@ -516,7 +567,6 @@ void App_Timer1ms(void)
     g_limit2.Timer1ms();
     g_igniter.Timer1ms();
 
-    App_CanProcess();
     BackendProcess();
 
     uint16_t pwm = g_igniter.GetPwm();
