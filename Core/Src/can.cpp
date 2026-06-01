@@ -131,21 +131,26 @@ static void App_CanTxProcessBus(FDCAN_HandleTypeDef *hfdcan,
                                 uint32_t *stall_since_ms)
 {
   uint32_t now = HAL_GetTick();
+ // uint8_t num_send = 0;
+
+  FDCAN_TxHeaderTypeDef txHeader;
+  txHeader.IdType = FDCAN_EXTENDED_ID;
+  txHeader.TxFrameType = FDCAN_DATA_FRAME;
+  txHeader.DataLength = FDCAN_DLC_BYTES_8;
+  txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  txHeader.BitRateSwitch = FDCAN_BRS_OFF;
+  txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+  txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  txHeader.MessageMarker = 0;
+
   while (*head != *tail) {
     CanTxEntry *e = &ring[*tail];
-    FDCAN_TxHeaderTypeDef txHeader;
+
 
     txHeader.Identifier = e->id;
-    txHeader.IdType = FDCAN_EXTENDED_ID;
-    txHeader.TxFrameType = FDCAN_DATA_FRAME;
-    txHeader.DataLength = FDCAN_DLC_BYTES_8;
-    txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
-    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
-    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
-    txHeader.MessageMarker = 0;
 
-    if (HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) == 0U) {
+
+    if (HAL_FDCAN_GetTxFifoFreeLevel(hfdcan) <= 1U) {
       if (*stall_since_ms == 0u) {
         *stall_since_ms = now;
       }
@@ -165,6 +170,11 @@ static void App_CanTxProcessBus(FDCAN_HandleTypeDef *hfdcan,
     if (*tail >= CAN_TX_RING_SIZE) {
       *tail = 0u;
     }
+
+   // num_send++;
+   // if(num_send > 2)
+   // 	break;
+
   }
 }
 
@@ -246,7 +256,7 @@ static void App_CanWatchdog(void)
     can1_tx_stall_since_ms = 0u;
   }
   if (can2_tx_head != can2_tx_tail && can2_tx_stall_since_ms != 0u &&
-      (now - can2_tx_stall_since_ms) >= CAN_TX_STALL_RECOVERY_MS) {
+      (now - can2_tx_stall_since_ms) >= (CAN_TX_STALL_RECOVERY_MS + 50)) {
     App_CanRecoverBus(&hfdcan2, 1u);
     g_can_tx_stall_recover_count[1]++;
     can2_tx_stall_since_ms = 0u;
