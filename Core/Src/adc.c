@@ -16,6 +16,12 @@ static volatile uint16_t lim1_high_adc_filtered = 0;
 static volatile uint16_t ign_adc_filtered = 0;
 static volatile uint16_t u24_adc_filtered = 0;
 
+uint16_t ADC_OFFSET[MCU_K3_NUM_ADC_CHANNEL] = {140};
+uint16_t ADC_COEF[MCU_K3_NUM_ADC_CHANNEL] = {11};
+
+uint16_t ADC_GetU24Filtered(void) { return (u24_adc_filtered  - ADC_OFFSET[0]) * ADC_COEF[0]; }
+
+
 static uint16_t SmaProcess(uint8_t num, uint16_t val)
 {
     uint16_t old_val = 0;
@@ -43,7 +49,6 @@ uint16_t ADC_GetLimit1HighFiltered(void) { return lim1_high_adc_filtered; }
 uint16_t ADC_GetLimit2LowFiltered(void)  { return lim2_low_adc_filtered;  }
 uint16_t ADC_GetLimit2HighFiltered(void) { return lim2_high_adc_filtered; }
 uint16_t ADC_GetIgniterFiltered(void)    { return ign_adc_filtered;       }
-uint16_t ADC_GetU24Filtered(void)        { return u24_adc_filtered;       }
 
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
