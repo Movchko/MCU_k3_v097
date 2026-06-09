@@ -17,6 +17,8 @@ extern "C" {
 #include "main.h"
 #include "mku_cfg_flash.h"
 
+extern DTS_HandleTypeDef hdts;
+
 MKUCfg g_cfg;
 MKUCfg g_saved_cfg;
 
@@ -400,9 +402,21 @@ void App_Timer1ms(void)
         status_cnt++;
     } else {
         status_cnt = 0u;
+
+        int32_t temperature;
+        if(HAL_DTS_GetTemperature(&hdts, &temperature)!= HAL_OK)
+        {
+            /* DTS GetTemperature Error */
+        }
+
+        if(temperature > 128) temperature = 128;
+        if(temperature < -128) temperature = -128;
+
+        uint8_t temp = (uint8_t)temperature;
+
         uint8_t status_data[7] = {0};
         status_data[0] = (uint8_t)(now / 1000u);
-        status_data[1] = 0u;
+        status_data[1] = temp;
         status_data[2] = 0u;
         status_data[3] = 0u;
         status_data[4] = (uint8_t)(CAN1_Active | (CAN2_Active << 1));
