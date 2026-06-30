@@ -5,7 +5,9 @@ extern "C" {
 }
 
 #include "device_config.h"
+#include "device_button.hpp"
 #include "device_igniter.hpp"
+#include "app_igniter_launch.hpp"
 #include "device_lswitch.hpp"
 #include "mku_cfg_flash.h"
 #include "stm32h5xx_hal.h"
@@ -22,43 +24,43 @@ extern DTS_HandleTypeDef hdts;
 MKUCfg g_cfg;
 MKUCfg g_saved_cfg;
 
-/* 1: limit1, 2: limit2, 3: igniter */
-static VDeviceLimitSwitch g_limit1(1);
+/* 1: button, 2: limit2, 3: igniter */
+static VDeviceButton g_button1(1);
 static VDeviceLimitSwitch g_limit2(2);
 static VDeviceIgniter g_igniter(3);
 
-/* Калибровка "сырых" Ом в шкалу порогов device_lib:
- * - открытие должно попадать в 100..159 Ом
- * - норма должна попадать в 820..2000 Ом
- * Точки калибровки с текущего стенда:
- *   raw=0      -> mapped=120  (Открытие)
- *   raw=18437  -> mapped=1000 (Норма)
+/* Пересчёт физических Ом K3 в шкалу порогов device_lib.
+ * Опорные точки имитатора (NO):
+ *   248 Ом  — норма       -> ~1000 Ом (Normal)
+ *   1800 Ом — срабатывание -> ~120 Ом (Press)
+ * NC: целевые значения на концах меняются местами.
  */
 static uint16_t App_MapLswitchResistanceForLib(uint32_t raw_ohm, uint8_t normal_closed)
 {
-    const uint32_t RAW_OPEN  = 0u;
-    const uint32_t LIB_OPEN  = 120u;
-    const uint32_t RAW_NORM  = 18437u;
-    const uint32_t LIB_NORM  = 1000u;
-    const uint32_t dst_open  = normal_closed ? LIB_NORM : LIB_OPEN;
-    const uint32_t dst_norm  = normal_closed ? LIB_OPEN : LIB_NORM;
+    const uint32_t RAW_NORMAL  = 248u;
+    const uint32_t RAW_TRIGGER = 1800u;
+    const uint32_t LIB_NORMAL  = 1000u;
+    const uint32_t LIB_TRIGGER = 120u;
 
-    if (raw_ohm <= RAW_OPEN) {
-        return (uint16_t)dst_open;
+    const uint32_t dst_normal  = normal_closed ? LIB_TRIGGER : LIB_NORMAL;
+    const uint32_t dst_trigger = normal_closed ? LIB_NORMAL : LIB_TRIGGER;
+
+    if (raw_ohm <= RAW_NORMAL) {
+        return (uint16_t)dst_normal;
+    }
+    if (raw_ohm >= RAW_TRIGGER) {
+        return (uint16_t)dst_trigger;
     }
 
-    /* Линейная интерполяция между двумя опорными точками.
-     * В режиме NC наклон отрицательный, поэтому считаем в signed.
-     */
-    const int32_t den = (int32_t)(RAW_NORM - RAW_OPEN);
-    const int32_t d_dst = (int32_t)dst_norm - (int32_t)dst_open;
-    int64_t num = (int64_t)((int32_t)raw_ohm - (int32_t)RAW_OPEN) * (int64_t)d_dst;
+    const int32_t den = (int32_t)(RAW_TRIGGER - RAW_NORMAL);
+    const int32_t d_dst = (int32_t)dst_trigger - (int32_t)dst_normal;
+    int64_t num = (int64_t)((int32_t)raw_ohm - (int32_t)RAW_NORMAL) * (int64_t)d_dst;
     if (num >= 0) {
         num += (int64_t)(den / 2);
     } else {
         num -= (int64_t)(den / 2);
     }
-    int64_t mapped_signed = (int64_t)(int32_t)dst_open + (num / (int64_t)den);
+    int64_t mapped_signed = (int64_t)(int32_t)dst_normal + (num / (int64_t)den);
 
     if (mapped_signed < 0) {
         mapped_signed = 0;
@@ -95,9 +97,61 @@ static int8_t App_FindIgniterSlotByMsgId(uint32_t MsgID)
     return -1;
 }
 
+static void App_ArmIgniterSlot(uint8_t ign_slot, uint8_t zd, uint8_t md)
+{
+    uint32_t delay_ms = ((uint32_t)zd + (uint32_t)md) * 1000u;
+
+    g_extinguish_deadline_ms[ign_slot] = HAL_GetTick() + delay_ms;
+    g_extinguish_armed[ign_slot] = 1u;
+    SetReplyStartExtinguishment((uint8_t)(ign_slot + 1u));
+}
+
+static void App_ArmIgniterSlotWithLaunch(uint8_t ign_slot, uint8_t launch_type, uint8_t cmd_zd, uint8_t cmd_md)
+{
+    uint8_t zd = 0u;
+    uint8_t md = 0u;
+
+    Backend_ResolveIgniterStartDelays(launch_type, cmd_zd, cmd_md, ign_slot,
+                                      g_cfg.zone_delay, g_cfg.module_delay, NUM_DEV_IN_MCU,
+                                      &zd, &md);
+    App_ArmIgniterSlot(ign_slot, zd, md);
+}
+
+static void App_ArmAllIgnitersWithLaunch(uint8_t launch_type, uint8_t cmd_zd, uint8_t cmd_md)
+{
+    for (uint8_t i = 0u; i < NUM_DEV_IN_MCU; i++) {
+        if (g_cfg.VDtype[i] == DEVICE_IGNITER_TYPE) {
+            App_ArmIgniterSlotWithLaunch(i, launch_type, cmd_zd, cmd_md);
+        }
+    }
+}
+
+extern "C" void VDeviceButton_OnStartExtinguishment(uint8_t zone,
+                                                  uint8_t zone_delay_s,
+                                                  uint8_t module_delay_s,
+                                                  uint8_t launch_type)
+{
+    if (!Backend_StartExtinguishZoneParamMatches(zone, g_cfg.UId.devId.zone)) {
+        return;
+    }
+    App_ArmAllIgnitersWithLaunch(launch_type, zone_delay_s, module_delay_s);
+}
+
 extern "C" void RcvStartExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_mine)
 {
     if (is_mine == 0u) {
+        return;
+    }
+
+    uint8_t zd = MsgData[2];
+    uint8_t md = MsgData[3];
+    uint8_t launch_type = MsgData[4];
+
+    if (Backend_IsIgniterBroadcastId(MsgID)) {
+        if (!Backend_StartExtinguishZoneMatches(MsgID, MsgData[1], g_cfg.UId.devId.zone)) {
+            return;
+        }
+        App_ArmAllIgnitersWithLaunch(launch_type, zd, md);
         return;
     }
 
@@ -106,14 +160,35 @@ extern "C" void RcvStartExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t
         return;
     }
 
-    /* payload backend fire: [0]=cmd, [1]=zone, [2]=zone_delay_s, [3]=module_delay_s */
-    uint8_t zd = MsgData[2];
-    uint8_t md = MsgData[3];
-    uint32_t delay_ms = ((uint32_t)zd + (uint32_t)md) * 1000u;
+    App_ArmIgniterSlotWithLaunch((uint8_t)ign_slot, launch_type, zd, md);
+}
 
-    g_extinguish_deadline_ms[(uint8_t)ign_slot] = HAL_GetTick() + delay_ms;
-    g_extinguish_armed[(uint8_t)ign_slot] = 1u;
-    SetReplyStartExtinguishment((uint8_t)(ign_slot + 1)); /* slot2->dev3 */
+static uint8_t App_IsIgniterSlot(uint8_t slot, void *ctx)
+{
+    (void)ctx;
+    if (slot >= NUM_DEV_IN_MCU) {
+        return 0u;
+    }
+    return (g_cfg.VDtype[slot] == DEVICE_IGNITER_TYPE) ? 1u : 0u;
+}
+
+static uint8_t App_IsIgniterBurnRunning(uint8_t slot, void *ctx)
+{
+    (void)ctx;
+    if (slot == 2u) {
+        return g_igniter.IsBurnRunning() ? 1u : 0u;
+    }
+    return 0u;
+}
+
+static void App_FireIgniterSlot(uint8_t slot, void *ctx)
+{
+    (void)ctx;
+    g_extinguish_armed[slot] = 0u;
+    uint8_t params[7] = {0};
+    if (slot == 2u) {
+        g_igniter.CommandCB(10, params);
+    }
 }
 
 extern "C" void RcvStopExtinguishment(uint32_t MsgID, uint8_t *MsgData, uint8_t is_mine)
@@ -188,19 +263,25 @@ void DefaultConfig(void)
     g_cfg.UId.devId.h_adr  = hadr;
     g_cfg.UId.devId.d_type = DEVICE_MCU_K3;
 
-    g_cfg.VDtype[0] = DEVICE_LSWITCH_TYPE;
+    g_cfg.VDtype[0] = DEVICE_BUTTON_TYPE;
     g_cfg.VDtype[1] = DEVICE_LSWITCH_TYPE;
     g_cfg.VDtype[2] = DEVICE_IGNITER_TYPE;
 
-    DeviceDPTConfig *l1 = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[0].reserv);
+    g_cfg.zone_delay = 5u;
+    g_cfg.module_delay[0] = 0u;
+    g_cfg.module_delay[1] = 0u;
+    g_cfg.module_delay[2] = 2u;
+
+    DeviceButtonConfig *btn1 = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
     DeviceDPTConfig *l2 = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[1].reserv);
-    memset(l1, 0, sizeof(DeviceDPTConfig));
+    memset(btn1, 0, sizeof(DeviceButtonConfig));
     memset(l2, 0, sizeof(DeviceDPTConfig));
 
-    l1->mode                  = 1; /* концевик */
-    l1->use_max               = 0;
-    l1->max_fire_threshold_c  = 60;
-    l1->state_change_delay_ms = 100;
+    btn1->mode                  = 2; /* кнопка */
+    btn1->use_max               = 0;
+    btn1->max_fire_threshold_c  = 60;
+    btn1->state_change_delay_ms = 100;
+    btn1->button_kind           = DeviceButtonKind_StartSP;
 
     l2->mode                  = 1; /* концевик */
     l2->use_max               = 0;
@@ -209,9 +290,9 @@ void DefaultConfig(void)
 
     DeviceIgniterConfig *ign = reinterpret_cast<DeviceIgniterConfig*>(g_cfg.Devices[2].reserv);
     memset(ign, 0, sizeof(DeviceIgniterConfig));
-    ign->disable_sc_check     = 1u;
-    ign->threshold_break_low  = 1000u;
-    ign->threshold_break_high = 3000u;
+    ign->disable_sc_check     = 0u;
+    ign->threshold_break_low  = 100;
+    ign->threshold_break_high = 1000;
     ign->burn_retry_count     = 0u;
 }
 
@@ -237,7 +318,7 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters)
 {
     switch (Dev) {
     case 0: MCU_K3CommandCB(Command, Parameters); break;
-    case 1: g_limit1.CommandCB(Command, Parameters); break;
+    case 1: g_button1.CommandCB(Command, Parameters); break;
     case 2: g_limit2.CommandCB(Command, Parameters); break;
     case 3: g_igniter.CommandCB(Command, Parameters); break;
     default: break;
@@ -263,13 +344,13 @@ void App_Init(void)
     SetConfigPtr(reinterpret_cast<uint8_t *>(&g_saved_cfg),
                  reinterpret_cast<uint8_t *>(&g_cfg));
 
-    g_limit1.DeviceInit(&g_cfg.Devices[0]);
-    g_limit1.VDeviceSetStatus = VDeviceSetStatus;
-    g_limit1.VDeviceSaveCfg   = SaveConfig;
-    g_limit1.DPT_SetResMeasureMode = App_DPT1_SetResMeasureMode;
-    g_limit1.DPT_SetMaxMeasureMode = App_DPT1_SetMaxMeasureMode;
-    g_limit1.Init();
-    g_cfg.VDtype[0] = g_limit1.GetDT();
+    g_button1.DeviceInit(&g_cfg.Devices[0]);
+    g_button1.VDeviceSetStatus = VDeviceSetStatus;
+    g_button1.VDeviceSaveCfg   = SaveConfig;
+    g_button1.DPT_SetResMeasureMode = App_DPT1_SetResMeasureMode;
+    g_button1.DPT_SetMaxMeasureMode = App_DPT1_SetMaxMeasureMode;
+    g_button1.Init();
+    g_cfg.VDtype[0] = g_button1.GetDT();
 
     g_limit2.DeviceInit(&g_cfg.Devices[1]);
     g_limit2.VDeviceSetStatus = VDeviceSetStatus;
@@ -294,7 +375,7 @@ void App_Init(void)
         BoardDevicesList[nDevs].zone   = g_cfg.UId.devId.zone;
         BoardDevicesList[nDevs].h_adr  = g_cfg.UId.devId.h_adr;
         BoardDevicesList[nDevs].l_adr  = 1;
-        BoardDevicesList[nDevs].d_type = g_limit1.GetDT();
+        BoardDevicesList[nDevs].d_type = g_button1.GetDT();
         nDevs++;
     }
     if (nDevs < MAX_DEVS) {
@@ -349,11 +430,10 @@ void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
     if (k_scaled > 1500) k_scaled = 1500;
 
     uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[0].reserv);
+    DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
     uint8_t normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
     uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
-
-    g_limit1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    g_button1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
 }
 
 void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
@@ -443,19 +523,6 @@ void App_Timer1ms(void)
         HAL_GPIO_TogglePin(LED_GPIO_Port, LED_Pin);
     }
 
-    for (uint8_t i = 0; i < NUM_DEV_IN_MCU; i++) {
-        if (!g_extinguish_armed[i]) {
-            continue;
-        }
-        if ((int32_t)(now - g_extinguish_deadline_ms[i]) >= 0) {
-            g_extinguish_armed[i] = 0u;
-            uint8_t params[7] = {0};
-            if (i == 2u) {
-                g_igniter.CommandCB(10, params);
-            }
-        }
-    }
-
     App_UpdateCanActivity();
 
     if (!g_igniter.IsPwmActive()) {
@@ -464,11 +531,16 @@ void App_Timer1ms(void)
         g_igniter.UpdateLineFromAdcMv(mv);
     }
 
-    g_limit1.Timer1ms();
+    g_button1.Timer1ms();
     g_limit2.Timer1ms();
-    g_igniter.Timer1ms();
 
     BackendProcess();
+
+    AppIgniter_RunSequentialScheduler(NUM_DEV_IN_MCU, now, g_extinguish_deadline_ms, g_extinguish_armed,
+                                      nullptr, App_IsIgniterSlot, App_IsIgniterBurnRunning,
+                                      App_FireIgniterSlot, nullptr);
+
+    g_igniter.Timer1ms();
 
     uint16_t pwm = g_igniter.GetPwm();
     extern TIM_HandleTypeDef htim4;

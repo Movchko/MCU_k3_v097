@@ -19,7 +19,7 @@ uint8_t App_GetCanStateMask(void);
 extern volatile uint8_t CAN1_Active;
 extern volatile uint8_t CAN2_Active;
 
-/* Обновление рассчитанных сопротивлений для двух концевиков (база DPT) */
+/* Обновление рассчитанных сопротивлений: канал 1 — кнопка, канал 2 — концевик */
 void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24);
 void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24);
 
