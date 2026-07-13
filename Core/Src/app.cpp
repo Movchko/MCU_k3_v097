@@ -19,13 +19,19 @@ extern "C" {
 #include "main.h"
 #include "mku_cfg_flash.h"
 
+extern "C" {
+extern TIM_HandleTypeDef htim4;
+}
+
 extern DTS_HandleTypeDef hdts;
 
 MKUCfg g_cfg;
 MKUCfg g_saved_cfg;
 
-/* 1: button, 2: limit2, 3: igniter */
+/* 1: line1, 2: line2, 3: igniter */
 static VDeviceButton g_button1(1);
+static VDeviceLimitSwitch g_limit1(1);
+static VDeviceButton g_button2(2);
 static VDeviceLimitSwitch g_limit2(2);
 static VDeviceIgniter g_igniter(3);
 
@@ -73,6 +79,132 @@ static uint16_t App_MapLswitchResistanceForLib(uint32_t raw_ohm, uint8_t normal_
 
 static uint32_t g_extinguish_deadline_ms[NUM_DEV_IN_MCU];
 static uint8_t  g_extinguish_armed[NUM_DEV_IN_MCU];
+
+static uint32_t ResetDelayms = 3000;
+static uint8_t isReset = 0;
+
+/* Слот 0/1: кнопка или концевик (VDtype 15/16), слот 2: спичка. VDtype==0 — отключён. */
+static uint8_t App_IsSlotEnabled(uint8_t slot)
+{
+	if (slot >= NUM_DEV_IN_MCU) {
+		return 0u;
+	}
+	return (g_cfg.VDtype[slot] != 0u) ? 1u : 0u;
+}
+
+static uint8_t App_IsButtonSlot(uint8_t slot)
+{
+	if (slot >= NUM_DEV_IN_MCU) {
+		return 0u;
+	}
+	return (g_cfg.VDtype[slot] == DEVICE_BUTTON_TYPE) ? 1u : 0u;
+}
+
+static uint8_t App_IsLswitchSlot(uint8_t slot)
+{
+	if (slot >= NUM_DEV_IN_MCU) {
+		return 0u;
+	}
+	return (g_cfg.VDtype[slot] == DEVICE_LSWITCH_TYPE) ? 1u : 0u;
+}
+
+static uint8_t App_IsLineSlotEnabled(uint8_t slot)
+{
+	return (App_IsButtonSlot(slot) || App_IsLswitchSlot(slot)) ? 1u : 0u;
+}
+
+static uint8_t App_IsIgniterSlotEnabled(uint8_t slot)
+{
+	if (slot >= NUM_DEV_IN_MCU) {
+		return 0u;
+	}
+	return (g_cfg.VDtype[slot] == DEVICE_IGNITER_TYPE) ? 1u : 0u;
+}
+
+static uint8_t App_SlotBoardDType(uint8_t slot)
+{
+	if (!App_IsSlotEnabled(slot)) {
+		return 0u;
+	}
+	return (uint8_t)(g_cfg.VDtype[slot] & 0xFFu);
+}
+
+static void App_RebuildBoardDevicesList(void)
+{
+	extern Device BoardDevicesList[];
+	extern uint8_t nDevs;
+
+	BoardDevicesList[0].zone   = g_cfg.UId.devId.zone;
+	BoardDevicesList[0].h_adr  = g_cfg.UId.devId.h_adr;
+	BoardDevicesList[0].l_adr  = g_cfg.UId.devId.l_adr;
+	BoardDevicesList[0].d_type = DEVICE_MCU_K3;
+
+	BoardDevicesList[1].zone   = g_cfg.UId.devId.zone;
+	BoardDevicesList[1].h_adr  = g_cfg.UId.devId.h_adr;
+	BoardDevicesList[1].l_adr  = 1;
+	BoardDevicesList[1].d_type = App_SlotBoardDType(0);
+
+	BoardDevicesList[2].zone   = g_cfg.UId.devId.zone;
+	BoardDevicesList[2].h_adr  = g_cfg.UId.devId.h_adr;
+	BoardDevicesList[2].l_adr  = 2;
+	BoardDevicesList[2].d_type = App_SlotBoardDType(1);
+
+	BoardDevicesList[3].zone   = g_cfg.UId.devId.zone;
+	BoardDevicesList[3].h_adr  = g_cfg.UId.devId.h_adr;
+	BoardDevicesList[3].l_adr  = 3;
+	BoardDevicesList[3].d_type = App_IsIgniterSlotEnabled(2) ? DEVICE_IGNITER_TYPE : 0u;
+
+	nDevs = 4;
+}
+
+static uint8_t App_IsBoardDevActive(uint8_t dnum)
+{
+	if (dnum == 1u) {
+		return App_IsLineSlotEnabled(0);
+	}
+	if (dnum == 2u) {
+		return App_IsLineSlotEnabled(1);
+	}
+	if (dnum == 3u) {
+		return App_IsIgniterSlotEnabled(2);
+	}
+	return 1u;
+}
+
+static void App_StopDisabledChannels(void)
+{
+	if (!App_IsIgniterSlotEnabled(2)) {
+		HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4);
+		g_extinguish_armed[2] = 0u;
+	}
+}
+
+/* callback статуса: отправляем его через CAN по протоколу backend */
+static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters)
+{
+    if (!App_IsBoardDevActive(DNum)) {
+        return;
+    }
+    uint8_t data[7] = {0};
+    for (uint8_t i = 0; i < 7; i++) {
+        data[i] = Parameters[i];
+    }
+    SendMessage(DNum, Code, data, 0, BUS_CAN12);
+}
+
+static void App_InitLineDevice(VDeviceButton &button, VDeviceLimitSwitch &lswitch,
+                               void (*set_res)(void), void (*set_max)(void))
+{
+	button.VDeviceSetStatus = VDeviceSetStatus;
+	button.VDeviceSaveCfg   = SaveConfig;
+	button.DPT_SetResMeasureMode = set_res;
+	button.DPT_SetMaxMeasureMode = set_max;
+
+	lswitch.VDeviceSetStatus = VDeviceSetStatus;
+	lswitch.VDeviceSaveCfg   = SaveConfig;
+	lswitch.DPT_SetResMeasureMode = set_res;
+	lswitch.DPT_SetMaxMeasureMode = set_max;
+}
 
 void RcvSetSystemTime(uint8_t *data) { (void)data; }
 void RcvStatusFire() {}
@@ -212,24 +344,12 @@ static void App_DPT1_SetMaxMeasureMode() { HAL_GPIO_WritePin(LINE1_EN_GPIO_Port,
 static void App_DPT2_SetResMeasureMode() { HAL_GPIO_WritePin(LINE2_EN_GPIO_Port, LINE2_EN_Pin, GPIO_PIN_SET); }
 static void App_DPT2_SetMaxMeasureMode() { HAL_GPIO_WritePin(LINE2_EN_GPIO_Port, LINE2_EN_Pin, GPIO_PIN_SET); }
 
-/* callback статуса: отправляем его через CAN по протоколу backend */
-static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Parameters)
-{
-    uint8_t data[7] = {0};
-    for (uint8_t i = 0; i < 7; i++) {
-        data[i] = Parameters[i];
-    }
-    SendMessage(DNum, Code, data, 0, BUS_CAN12);
-}
+
 
 void SetHAdr(uint8_t h_adr)
 {
     g_cfg.UId.devId.h_adr = h_adr;
-    extern uint8_t nDevs;
-    extern Device BoardDevicesList[];
-    for (uint8_t i = 0; i < nDevs; i++) {
-        BoardDevicesList[i].h_adr = g_cfg.UId.devId.h_adr;
-    }
+    App_RebuildBoardDevicesList();
     SaveConfig();
 }
 
@@ -270,7 +390,7 @@ void DefaultConfig(void)
     g_cfg.zone_delay = 5u;
     g_cfg.module_delay[0] = 0u;
     g_cfg.module_delay[1] = 0u;
-    g_cfg.module_delay[2] = 2u;
+    g_cfg.module_delay[2] = 5u;
 
     DeviceButtonConfig *btn1 = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
     DeviceDPTConfig *l2 = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[1].reserv);
@@ -296,7 +416,10 @@ void DefaultConfig(void)
     ign->burn_retry_count     = 0u;
 }
 
-void ResetMCU(void) { NVIC_SystemReset(); }
+void ResetMCU(void)
+{
+    isReset = 1;
+}
 
 uint32_t GetID(void)
 {
@@ -318,11 +441,33 @@ void CommandCB(uint8_t Dev, uint8_t Command, uint8_t *Parameters)
 {
     switch (Dev) {
     case 0: MCU_K3CommandCB(Command, Parameters); break;
-    case 1: g_button1.CommandCB(Command, Parameters); break;
-    case 2: g_limit2.CommandCB(Command, Parameters); break;
-    case 3: g_igniter.CommandCB(Command, Parameters); break;
+    case 1:
+        if (App_IsButtonSlot(0)) {
+            g_button1.CommandCB(Command, Parameters);
+        } else if (App_IsLswitchSlot(0)) {
+            g_limit1.CommandCB(Command, Parameters);
+        }
+        break;
+    case 2:
+        if (App_IsButtonSlot(1)) {
+            g_button2.CommandCB(Command, Parameters);
+        } else if (App_IsLswitchSlot(1)) {
+            g_limit2.CommandCB(Command, Parameters);
+        }
+        break;
+    case 3:
+        if (App_IsIgniterSlotEnabled(2)) {
+            g_igniter.CommandCB(Command, Parameters);
+        }
+        break;
     default: break;
     }
+}
+
+void AplyConfig(void)
+{
+    App_RebuildBoardDevicesList();
+    App_StopDisabledChannels();
 }
 
 void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData)
@@ -333,9 +478,6 @@ void ListenerCommandCB(uint32_t MsgID, uint8_t *MsgData)
 
 void App_Init(void)
 {
-    extern Device BoardDevicesList[];
-    extern uint8_t nDevs;
-
     if (!FlashReadConfig(&g_cfg)) {
         DefaultConfig();
         SaveConfig();
@@ -345,56 +487,30 @@ void App_Init(void)
                  reinterpret_cast<uint8_t *>(&g_cfg));
 
     g_button1.DeviceInit(&g_cfg.Devices[0]);
-    g_button1.VDeviceSetStatus = VDeviceSetStatus;
-    g_button1.VDeviceSaveCfg   = SaveConfig;
-    g_button1.DPT_SetResMeasureMode = App_DPT1_SetResMeasureMode;
-    g_button1.DPT_SetMaxMeasureMode = App_DPT1_SetMaxMeasureMode;
+    App_InitLineDevice(g_button1, g_limit1, App_DPT1_SetResMeasureMode, App_DPT1_SetMaxMeasureMode);
     g_button1.Init();
-    g_cfg.VDtype[0] = g_button1.GetDT();
+    g_limit1.DeviceInit(&g_cfg.Devices[0]);
+    g_limit1.Init();
 
+    g_button2.DeviceInit(&g_cfg.Devices[1]);
+    App_InitLineDevice(g_button2, g_limit2, App_DPT2_SetResMeasureMode, App_DPT2_SetMaxMeasureMode);
+    g_button2.Init();
     g_limit2.DeviceInit(&g_cfg.Devices[1]);
-    g_limit2.VDeviceSetStatus = VDeviceSetStatus;
-    g_limit2.VDeviceSaveCfg   = SaveConfig;
-    g_limit2.DPT_SetResMeasureMode = App_DPT2_SetResMeasureMode;
-    g_limit2.DPT_SetMaxMeasureMode = App_DPT2_SetMaxMeasureMode;
     g_limit2.Init();
-    g_cfg.VDtype[1] = g_limit2.GetDT();
 
     g_igniter.DeviceInit(&g_cfg.Devices[2]);
     g_igniter.VDeviceSetStatus = VDeviceSetStatus;
     g_igniter.VDeviceSaveCfg   = SaveConfig;
     g_igniter.Init();
 
-    nDevs = 1;
-    BoardDevicesList[0].zone   = g_cfg.UId.devId.zone;
-    BoardDevicesList[0].h_adr  = g_cfg.UId.devId.h_adr;
-    BoardDevicesList[0].l_adr  = g_cfg.UId.devId.l_adr;
-    BoardDevicesList[0].d_type = DEVICE_MCU_K3;
+    App_RebuildBoardDevicesList();
 
-    if (nDevs < MAX_DEVS) {
-        BoardDevicesList[nDevs].zone   = g_cfg.UId.devId.zone;
-        BoardDevicesList[nDevs].h_adr  = g_cfg.UId.devId.h_adr;
-        BoardDevicesList[nDevs].l_adr  = 1;
-        BoardDevicesList[nDevs].d_type = g_button1.GetDT();
-        nDevs++;
+    if (App_IsLineSlotEnabled(0)) {
+        App_DPT1_SetResMeasureMode();
     }
-    if (nDevs < MAX_DEVS) {
-        BoardDevicesList[nDevs].zone   = g_cfg.UId.devId.zone;
-        BoardDevicesList[nDevs].h_adr  = g_cfg.UId.devId.h_adr;
-        BoardDevicesList[nDevs].l_adr  = 2;
-        BoardDevicesList[nDevs].d_type = g_limit2.GetDT();
-        nDevs++;
+    if (App_IsLineSlotEnabled(1)) {
+        App_DPT2_SetResMeasureMode();
     }
-    if (nDevs < MAX_DEVS) {
-        BoardDevicesList[nDevs].zone   = g_cfg.UId.devId.zone;
-        BoardDevicesList[nDevs].h_adr  = g_cfg.UId.devId.h_adr;
-        BoardDevicesList[nDevs].l_adr  = 3;
-        BoardDevicesList[nDevs].d_type = DEVICE_IGNITER_TYPE;
-        nDevs++;
-    }
-
-    App_DPT1_SetResMeasureMode();
-    App_DPT2_SetResMeasureMode();
 
     extern bool isListener;
     isListener = true;
@@ -402,6 +518,10 @@ void App_Init(void)
 
 void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
 {
+    if (!App_IsLineSlotEnabled(0)) {
+        return;
+    }
+
     const uint32_t VREF_MV = 3300u;
     const uint32_t ADC_MAX = 4095u;
     const uint32_t R0_OHM  = 1925u;
@@ -430,14 +550,28 @@ void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
     if (k_scaled > 1500) k_scaled = 1500;
 
     uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
-    uint8_t normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    uint8_t normal_closed = 0u;
+    if (App_IsButtonSlot(0)) {
+        DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
+        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    } else if (App_IsLswitchSlot(0)) {
+        DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[0].reserv);
+        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    }
     uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
-    g_button1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    if (App_IsButtonSlot(0)) {
+        g_button1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    } else if (App_IsLswitchSlot(0)) {
+        g_limit1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    }
 }
 
 void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
 {
+    if (!App_IsLineSlotEnabled(1)) {
+        return;
+    }
+
     const uint32_t VREF_MV = 3300u;
     const uint32_t ADC_MAX = 4095u;
     const uint32_t R0_OHM  = 1925u;
@@ -466,10 +600,20 @@ void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
     if (k_scaled > 1500) k_scaled = 1500;
 
     uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[1].reserv);
-    uint8_t normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    uint8_t normal_closed = 0u;
+    if (App_IsButtonSlot(1)) {
+        DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[1].reserv);
+        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    } else if (App_IsLswitchSlot(1)) {
+        DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[1].reserv);
+        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+    }
     uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
-    g_limit2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    if (App_IsButtonSlot(1)) {
+        g_button2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    } else if (App_IsLswitchSlot(1)) {
+        g_limit2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+    }
 }
 
 void App_Timer1ms(void)
@@ -525,14 +669,30 @@ void App_Timer1ms(void)
 
     App_UpdateCanActivity();
 
-    if (!g_igniter.IsPwmActive()) {
+    // задержка софт-рестарта. нужно чтобы усройство успело широковещательную переслать команду дальше
+    if (isReset) {
+        ResetDelayms--;
+        if (ResetDelayms == 0u) {
+            NVIC_SystemReset();
+        }
+    }
+
+    if (App_IsIgniterSlotEnabled(2) && !g_igniter.IsPwmActive()) {
         uint16_t raw = ADC_GetIgniterFiltered();
         uint16_t mv = (uint16_t)((uint32_t)raw * 3300u / 4095u);
         g_igniter.UpdateLineFromAdcMv(mv);
     }
 
-    g_button1.Timer1ms();
-    g_limit2.Timer1ms();
+    if (App_IsButtonSlot(0)) {
+        g_button1.Timer1ms();
+    } else if (App_IsLswitchSlot(0)) {
+        g_limit1.Timer1ms();
+    }
+    if (App_IsButtonSlot(1)) {
+        g_button2.Timer1ms();
+    } else if (App_IsLswitchSlot(1)) {
+        g_limit2.Timer1ms();
+    }
 
     BackendProcess();
 
@@ -540,13 +700,18 @@ void App_Timer1ms(void)
                                       nullptr, App_IsIgniterSlot, App_IsIgniterBurnRunning,
                                       App_FireIgniterSlot, nullptr);
 
-    g_igniter.Timer1ms();
+    if (App_IsIgniterSlotEnabled(2)) {
+        g_igniter.Timer1ms();
+    }
 
-    uint16_t pwm = g_igniter.GetPwm();
-    extern TIM_HandleTypeDef htim4;
-    if (pwm > 0u) {
-        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
-        __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, pwm);
+    if (App_IsIgniterSlotEnabled(2)) {
+        uint16_t pwm = g_igniter.GetPwm();
+        if (pwm > 0u) {
+            HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
+            __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, pwm);
+        } else {
+            HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4);
+        }
     } else {
         HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4);
     }
