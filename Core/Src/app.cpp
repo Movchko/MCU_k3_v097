@@ -400,13 +400,13 @@ void DefaultConfig(void)
     btn1->mode                  = 2; /* кнопка */
     btn1->use_max               = 0;
     btn1->max_fire_threshold_c  = 60;
-    btn1->state_change_delay_ms = 100;
+    btn1->state_change_delay_ms = 300;
     btn1->button_kind           = DeviceButtonKind_StartSP;
 
     l2->mode                  = 1; /* концевик */
     l2->use_max               = 0;
     l2->max_fire_threshold_c  = 60;
-    l2->state_change_delay_ms = 100;
+    l2->state_change_delay_ms = 300;
 
     DeviceIgniterConfig *ign = reinterpret_cast<DeviceIgniterConfig*>(g_cfg.Devices[2].reserv);
     memset(ign, 0, sizeof(DeviceIgniterConfig));
