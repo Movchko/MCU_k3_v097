@@ -192,16 +192,22 @@ static void VDeviceSetStatus(uint8_t DNum, uint8_t Code, const uint8_t *Paramete
     SendMessage(DNum, Code, data, 0, BUS_CAN12);
 }
 
+static void App_SaveConfigAndApply(void)
+{
+	SaveConfig();
+	AplyConfig();
+}
+
 static void App_InitLineDevice(VDeviceButton &button, VDeviceLimitSwitch &lswitch,
                                void (*set_res)(void), void (*set_max)(void))
 {
 	button.VDeviceSetStatus = VDeviceSetStatus;
-	button.VDeviceSaveCfg   = SaveConfig;
+	button.VDeviceSaveCfg   = App_SaveConfigAndApply;
 	button.DPT_SetResMeasureMode = set_res;
 	button.DPT_SetMaxMeasureMode = set_max;
 
 	lswitch.VDeviceSetStatus = VDeviceSetStatus;
-	lswitch.VDeviceSaveCfg   = SaveConfig;
+	lswitch.VDeviceSaveCfg   = App_SaveConfigAndApply;
 	lswitch.DPT_SetResMeasureMode = set_res;
 	lswitch.DPT_SetMaxMeasureMode = set_max;
 }
@@ -434,6 +440,7 @@ void MCU_K3CommandCB(uint8_t Command, uint8_t *Parameters)
     if (Command == 20) {
         g_cfg.UId.devId.zone = Parameters[0];
         SaveConfig();
+        AplyConfig();
     }
 }
 
@@ -500,7 +507,7 @@ void App_Init(void)
 
     g_igniter.DeviceInit(&g_cfg.Devices[2]);
     g_igniter.VDeviceSetStatus = VDeviceSetStatus;
-    g_igniter.VDeviceSaveCfg   = SaveConfig;
+    g_igniter.VDeviceSaveCfg   = App_SaveConfigAndApply;
     g_igniter.Init();
 
     App_RebuildBoardDevicesList();
