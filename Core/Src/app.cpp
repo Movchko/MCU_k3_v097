@@ -478,6 +478,8 @@ void DefaultConfig(void)
     ign->threshold_break_low  = 100;
     ign->threshold_break_high = 1000;
     ign->burn_retry_count     = 0u;
+    ign->burn_ramp_ms         = 10u;
+    ign->burn_hold_ms         = 20u;
 }
 
 void ResetMCU(void)
