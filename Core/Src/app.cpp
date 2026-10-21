@@ -424,25 +424,25 @@ void DefaultConfig(void)
     btn1->max_fire_threshold_c  = 60;
     btn1->state_change_delay_ms = 300;
     btn1->button_kind           = DeviceButtonKind_StartSP;
-    btn1->limit_break           = 6200;
-    btn1->limit_normal          = 4100;
-    btn1->limit_fault           = 160;
-    btn1->limit_fire            = 100;
+    btn1->limit_break           = DPT_LIMIT_BREAK;
+    btn1->limit_normal          = DPT_LIMIT_NORMAL;
+    btn1->limit_fault           = DPT_LIMIT_FAULT;
+    btn1->limit_fire            = DPT_LIMIT_FIRE;
 
     l2->mode                  = 1; /* концевик */
     l2->use_max               = 0;
     l2->max_fire_threshold_c  = 60;
     l2->state_change_delay_ms = 300;
-    l2->limit_break           = 6200;
-    l2->limit_normal          = 4100;
-    l2->limit_fault           = 160;
-    l2->limit_fire            = 100;
+    l2->limit_break           = DPT_LIMIT_BREAK;
+    l2->limit_normal          = DPT_LIMIT_NORMAL;
+    l2->limit_fault           = DPT_LIMIT_FAULT;
+    l2->limit_fire            = DPT_LIMIT_FIRE;
 
     DeviceIgniterConfig *ign = reinterpret_cast<DeviceIgniterConfig*>(g_cfg.Devices[2].reserv);
     memset(ign, 0, sizeof(DeviceIgniterConfig));
     ign->disable_sc_check     = 0u;
-    ign->threshold_break_low  = 1000;
-    ign->threshold_break_high = 6200;
+    ign->threshold_break_low  = IGNITER_TH_LOW_DEFAULT;
+    ign->threshold_break_high = IGNITER_TH_HIGH_DEFAULT;
     ign->burn_retry_count     = 0u;
     ign->burn_ramp_ms         = 10u;
     ign->burn_hold_ms         = 20u;
