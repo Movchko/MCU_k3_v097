@@ -35,48 +35,6 @@ static VDeviceButton g_button2(2);
 static VDeviceLimitSwitch g_limit2(2);
 static VDeviceIgniter g_igniter(3);
 
-/* Пересчёт физических Ом K3 в шкалу порогов device_lib.
- * Опорные точки имитатора (NO):
- *   248 Ом  — норма       -> ~1000 Ом (Normal)
- *   1800 Ом — срабатывание -> ~120 Ом (Press)
- * NC: целевые значения на концах меняются местами.
- */
-static uint16_t App_MapLswitchResistanceForLib(uint32_t raw_ohm, uint8_t normal_closed)
-{
-    const uint32_t RAW_NORMAL  = 248u;
-    const uint32_t RAW_TRIGGER = 1800u;
-    const uint32_t LIB_NORMAL  = 1000u;
-    const uint32_t LIB_TRIGGER = 120u;
-
-    const uint32_t dst_normal  = normal_closed ? LIB_TRIGGER : LIB_NORMAL;
-    const uint32_t dst_trigger = normal_closed ? LIB_NORMAL : LIB_TRIGGER;
-
-    if (raw_ohm <= RAW_NORMAL) {
-        return (uint16_t)dst_normal;
-    }
-    if (raw_ohm >= RAW_TRIGGER) {
-        return (uint16_t)dst_trigger;
-    }
-
-    const int32_t den = (int32_t)(RAW_TRIGGER - RAW_NORMAL);
-    const int32_t d_dst = (int32_t)dst_trigger - (int32_t)dst_normal;
-    int64_t num = (int64_t)((int32_t)raw_ohm - (int32_t)RAW_NORMAL) * (int64_t)d_dst;
-    if (num >= 0) {
-        num += (int64_t)(den / 2);
-    } else {
-        num -= (int64_t)(den / 2);
-    }
-    int64_t mapped_signed = (int64_t)(int32_t)dst_normal + (num / (int64_t)den);
-
-    if (mapped_signed < 0) {
-        mapped_signed = 0;
-    }
-    if (mapped_signed > 65535) {
-        mapped_signed = 65535;
-    }
-    return (uint16_t)mapped_signed;
-}
-
 static uint32_t g_extinguish_deadline_ms[NUM_DEV_IN_MCU];
 static uint8_t  g_extinguish_armed[NUM_DEV_IN_MCU];
 static uint8_t  g_extinguish_paused[NUM_DEV_IN_MCU];
@@ -457,26 +415,34 @@ void DefaultConfig(void)
     g_cfg.module_delay[2] = 5u;
 
     DeviceButtonConfig *btn1 = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
-    DeviceDPTConfig *l2 = reinterpret_cast<DeviceDPTConfig*>(g_cfg.Devices[1].reserv);
+    DeviceLimitSwitchConfig *l2 = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[1].reserv);
     memset(btn1, 0, sizeof(DeviceButtonConfig));
-    memset(l2, 0, sizeof(DeviceDPTConfig));
+    memset(l2, 0, sizeof(DeviceLimitSwitchConfig));
 
     btn1->mode                  = 2; /* кнопка */
     btn1->use_max               = 0;
     btn1->max_fire_threshold_c  = 60;
     btn1->state_change_delay_ms = 300;
     btn1->button_kind           = DeviceButtonKind_StartSP;
+    btn1->limit_break           = 6200;
+    btn1->limit_normal          = 4100;
+    btn1->limit_fault           = 160;
+    btn1->limit_fire            = 100;
 
     l2->mode                  = 1; /* концевик */
     l2->use_max               = 0;
     l2->max_fire_threshold_c  = 60;
     l2->state_change_delay_ms = 300;
+    l2->limit_break           = 6200;
+    l2->limit_normal          = 4100;
+    l2->limit_fault           = 160;
+    l2->limit_fire            = 100;
 
     DeviceIgniterConfig *ign = reinterpret_cast<DeviceIgniterConfig*>(g_cfg.Devices[2].reserv);
     memset(ign, 0, sizeof(DeviceIgniterConfig));
     ign->disable_sc_check     = 0u;
-    ign->threshold_break_low  = 100;
-    ign->threshold_break_high = 1000;
+    ign->threshold_break_low  = 1000;
+    ign->threshold_break_high = 6200;
     ign->burn_retry_count     = 0u;
     ign->burn_ramp_ms         = 10u;
     ign->burn_hold_ms         = 20u;
@@ -583,104 +549,78 @@ void App_Init(void)
     isListener = true;
 }
 
+/* Rлинии = 1925 * (Uh - Ul) / Ul, напряжения после делителя.
+ * Питание зафиксировано 5 В, поэтому k = 327/1000 — константа.
+ * Подгонка (15*r - 1000)/4 слита с этим k:
+ *   Ом = 4905/4000 * Rлинии - 250.
+ * Точки старой шкалы 1400, 1100, 900, 600, 300 дают
+ * 4998, 3873, 3123, 1998, 873 Ом (не больше 2 Ом от раздельного пересчёта). */
+static uint16_t DptAdcToOhm(uint16_t ch_l, uint16_t ch_h)
+{
+    uint32_t vl = (uint32_t)ch_l * 3300u / 4095u * 2u;
+    uint32_t vh = (uint32_t)ch_h * 3300u / 4095u * 2u;
+    if (vl == 0u) {
+        vl = 1u;
+    }
+    if (vh <= vl) {
+        return 0u;
+    }
+
+    uint32_t r_line = 1925u * (vh - vl) / vl;
+    int64_t ohm = ((int64_t)r_line * 4905 - 1000000) / 4000;
+    if (ohm < 0) {
+        return 0u;
+    }
+    if (ohm > 65535) {
+        return 65535u;
+    }
+    return (uint16_t)ohm;
+}
+
 void App_SetLimit1AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
 {
+    (void)ch_u24;
     if (!App_IsLineSlotEnabled(0)) {
         return;
     }
 
-    const uint32_t VREF_MV = 3300u;
-    const uint32_t ADC_MAX = 4095u;
-    const uint32_t R0_OHM  = 1925u;
-    const uint32_t DIV_K   = 2;
-
-    uint32_t v_adc_l_mv = (uint32_t)ch_l * VREF_MV / ADC_MAX;
-    uint32_t v_adc_h_mv = (uint32_t)ch_h * VREF_MV / ADC_MAX;
-    uint32_t v_adc_u_mv = (uint32_t)ch_u24 * VREF_MV / ADC_MAX;
-
-    uint32_t v_line_l_mv = v_adc_l_mv * DIV_K;
-    uint32_t v_line_h_mv = v_adc_h_mv * DIV_K;
-    uint32_t u24_mv      = 5000 * DIV_K;//v_adc_u_mv * DIV_K; // мы всегда в этой версии и далее подаём 5В.
-
-    if (v_line_l_mv == 0u) {
-        v_line_l_mv = 1u;
-    }
-
-    uint32_t r_line_ohm = 0u;
-    if (v_line_h_mv > v_line_l_mv) {
-        r_line_ohm = R0_OHM * (v_line_h_mv - v_line_l_mv) / v_line_l_mv;
-    }
-
-    int32_t k_scaled = -346;
-    k_scaled += (int32_t)(673u * (u24_mv / 10u)) / 1000;
-    if (k_scaled < 300)  k_scaled = 300;
-    if (k_scaled > 1500) k_scaled = 1500;
-
-    uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    uint8_t normal_closed = 0u;
+    uint16_t ohm = DptAdcToOhm(ch_l, ch_h);
     if (App_IsButtonSlot(0)) {
-        DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[0].reserv);
-        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+        g_button1.SetAdcValues(ohm, 0);
     } else if (App_IsLswitchSlot(0)) {
-        DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[0].reserv);
-        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
-    }
-    uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
-    if (App_IsButtonSlot(0)) {
-        g_button1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
-    } else if (App_IsLswitchSlot(0)) {
-        g_limit1.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+        g_limit1.SetAdcValues(ohm, 0);
     }
 }
 
 void App_SetLimit2AdcValues(uint16_t ch_l, uint16_t ch_h, uint16_t ch_u24)
 {
+    (void)ch_u24;
     if (!App_IsLineSlotEnabled(1)) {
         return;
     }
 
-    const uint32_t VREF_MV = 3300u;
-    const uint32_t ADC_MAX = 4095u;
-    const uint32_t R0_OHM  = 1925u;
-    const uint32_t DIV_K   = 2;
-
-    uint32_t v_adc_l_mv = (uint32_t)ch_l * VREF_MV / ADC_MAX;
-    uint32_t v_adc_h_mv = (uint32_t)ch_h * VREF_MV / ADC_MAX;
-    uint32_t v_adc_u_mv = (uint32_t)ch_u24 * VREF_MV / ADC_MAX;
-
-    uint32_t v_line_l_mv = v_adc_l_mv * DIV_K;
-    uint32_t v_line_h_mv = v_adc_h_mv * DIV_K;
-    uint32_t u24_mv      = 5000 * DIV_K;//v_adc_u_mv * DIV_K; // мы всегда в этой версии и далее подаём 5В.
-
-    if (v_line_l_mv == 0u) {
-        v_line_l_mv = 1u;
-    }
-
-    uint32_t r_line_ohm = 0u;
-    if (v_line_h_mv > v_line_l_mv) {
-        r_line_ohm = R0_OHM * (v_line_h_mv - v_line_l_mv) / v_line_l_mv;
-    }
-
-    int32_t k_scaled = -346;
-    k_scaled += (int32_t)(673u * (u24_mv / 10u)) / 1000;
-    if (k_scaled < 300)  k_scaled = 300;
-    if (k_scaled > 1500) k_scaled = 1500;
-
-    uint32_t r_corr = (uint32_t)((r_line_ohm * (uint32_t)k_scaled + 500u) / 1000u);
-    uint8_t normal_closed = 0u;
+    uint16_t ohm = DptAdcToOhm(ch_l, ch_h);
     if (App_IsButtonSlot(1)) {
-        DeviceButtonConfig *cfg = reinterpret_cast<DeviceButtonConfig*>(g_cfg.Devices[1].reserv);
-        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+        g_button2.SetAdcValues(ohm, 0);
     } else if (App_IsLswitchSlot(1)) {
-        DeviceLimitSwitchConfig *cfg = reinterpret_cast<DeviceLimitSwitchConfig*>(g_cfg.Devices[1].reserv);
-        normal_closed = (cfg != nullptr && cfg->normal_closed) ? 1u : 0u;
+        g_limit2.SetAdcValues(ohm, 0);
     }
-    uint16_t r_for_lib = App_MapLswitchResistanceForLib(r_corr, normal_closed);
-    if (App_IsButtonSlot(1)) {
-        g_button2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
-    } else if (App_IsLswitchSlot(1)) {
-        g_limit2.SetAdcValues(r_for_lib, (uint16_t)ch_h);
+}
+
+/* Ом = (6743 * код_канала - 1060625) / 1000.
+ * Минимакс по точкам 875->5к, 759->4к, 626->3к, 469->2к, 282->1к.
+ * На этих точках ошибка не больше 160 Ом. */
+static uint16_t IgniterChannelToOhm(uint16_t channel)
+{
+    int32_t num = (int32_t)channel * 6743 - 1060625;
+    if (num < 0) {
+        return 0u;
     }
+    num = (num + 500) / 1000;
+    if (num > 65535) {
+        num = 65535;
+    }
+    return (uint16_t)num;
 }
 
 void App_Timer1ms(void)
@@ -746,8 +686,7 @@ void App_Timer1ms(void)
 
     if (App_IsIgniterSlotEnabled(2) && !g_igniter.IsPwmActive()) {
         uint16_t raw = ADC_GetIgniterFiltered();
-        uint16_t mv = (uint16_t)((uint32_t)raw * 3300u / 4095u);
-        g_igniter.UpdateLineFromAdcMv(mv);
+        g_igniter.UpdateLineFromAdc(IgniterChannelToOhm(raw));
     }
 
     if (App_IsButtonSlot(0)) {
